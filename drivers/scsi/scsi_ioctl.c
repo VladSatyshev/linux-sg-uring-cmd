@@ -15,6 +15,7 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/cdrom.h>
+#include <linux/io_uring.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -139,7 +140,7 @@ int scsi_set_medium_removal(struct scsi_device *sdev, char state)
 	int ret;
 
 	if (!sdev->removable || !sdev->lockable)
-	       return 0;
+		return 0;
 
 	scsi_cmd[0] = ALLOW_MEDIUM_REMOVAL;
 	scsi_cmd[1] = 0;
@@ -171,7 +172,7 @@ static int scsi_ioctl_get_pci(struct scsi_device *sdev, void __user *arg)
 	struct device *dev = scsi_get_device(sdev->host);
 	const char *name;
 
-        if (!dev)
+	if (!dev)
 		return -ENXIO;
 
 	name = dev_name(dev);
@@ -234,9 +235,9 @@ static int scsi_get_idlun(struct scsi_device *sdev, void __user *argp)
 {
 	struct scsi_idlun v = {
 		.dev_id = (sdev->id & 0xff) +
-			((sdev->lun & 0xff) << 8) +
-			((sdev->channel & 0xff) << 16) +
-			((sdev->host->host_no & 0xff) << 24),
+					  ((sdev->lun & 0xff) << 8) +
+					  ((sdev->channel & 0xff) << 16) +
+					  ((sdev->host->host_no & 0xff) << 24),
 		.host_unique_id = sdev->host->unique_id
 	};
 	if (copy_to_user(argp, &v, sizeof(struct scsi_idlun)))
@@ -362,7 +363,7 @@ bool scsi_cmd_allowed(unsigned char *cmd, bool open_for_write)
 EXPORT_SYMBOL(scsi_cmd_allowed);
 
 static int scsi_fill_sghdr_rq(struct scsi_device *sdev, struct request *rq,
-		struct sg_io_hdr *hdr, bool open_for_write)
+			      struct sg_io_hdr *hdr, bool open_for_write)
 {
 	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(rq);
 
@@ -386,7 +387,7 @@ static int scsi_fill_sghdr_rq(struct scsi_device *sdev, struct request *rq,
 }
 
 static int scsi_complete_sghdr_rq(struct request *rq, struct sg_io_hdr *hdr,
-		struct bio *bio)
+				  struct bio *bio)
 {
 	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(rq);
 	int r, ret = 0;
@@ -423,8 +424,42 @@ static int scsi_complete_sghdr_rq(struct request *rq, struct sg_io_hdr *hdr,
 	return ret;
 }
 
+static int scsi_complete_sghdr_rq_no_unmap_user(struct request *rq,
+						struct sg_io_hdr *hdr)
+{
+	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(rq);
+	int ret = 0;
+
+	/*
+	 * fill in all the output members
+	 */
+	hdr->status = scmd->result & 0xff;
+	hdr->masked_status = sg_status_byte(scmd->result);
+	hdr->msg_status = COMMAND_COMPLETE;
+	hdr->host_status = host_byte(scmd->result);
+	hdr->driver_status = 0;
+	if (scsi_status_is_check_condition(hdr->status))
+		hdr->driver_status = DRIVER_SENSE;
+	hdr->info = 0;
+	if (hdr->masked_status || hdr->host_status || hdr->driver_status)
+		hdr->info |= SG_INFO_CHECK;
+	hdr->resid = scmd->resid_len;
+	hdr->sb_len_wr = 0;
+
+	if (scmd->sense_len && hdr->sbp) {
+		int len = min((unsigned int)hdr->mx_sb_len, scmd->sense_len);
+
+		if (!copy_to_user(hdr->sbp, scmd->sense_buffer, len))
+			hdr->sb_len_wr = len;
+		else
+			ret = -EFAULT;
+	}
+
+	return ret;
+}
+
 static int sg_io(struct scsi_device *sdev, struct sg_io_hdr *hdr,
-		bool open_for_write)
+		 bool open_for_write)
 {
 	unsigned long start_time;
 	ssize_t ret = 0;
@@ -470,8 +505,8 @@ static int sg_io(struct scsi_device *sdev, struct sg_io_hdr *hdr,
 		goto out_put_request;
 
 	ret = blk_rq_map_user_io(rq, NULL, hdr->dxferp, hdr->dxfer_len,
-			GFP_KERNEL, hdr->iovec_count && hdr->dxfer_len,
-			hdr->iovec_count, 0, rq_data_dir(rq));
+				 GFP_KERNEL, hdr->iovec_count && hdr->dxfer_len,
+				 hdr->iovec_count, 0, rq_data_dir(rq));
 	if (ret)
 		goto out_put_request;
 
@@ -490,6 +525,184 @@ out_put_request:
 	blk_mq_free_request(rq);
 	return ret;
 }
+
+static void sg_uring_task_cb(struct io_uring_cmd *ioucmd, unsigned issue_flags)
+{
+	// printk("inside sg_uring_task_cb\n");
+	struct sg_uring_cmd_pdu *pdu = (struct sg_uring_cmd_pdu *)&ioucmd->pdu;
+
+	if (pdu->req) {
+		// printk("Before blk_mq_free_request: pdu->hdr = %p, interface_id = %c\n",
+		//    pdu->hdr, pdu->hdr->interface_id);
+		blk_mq_free_request(pdu->req);
+	}
+
+	if (pdu->bio) {
+		// printk("Before blk_rq_unmap_user: pdu->hdr = %p, interface_id = %c\n",
+		//    pdu->hdr, pdu->hdr->interface_id);
+		blk_rq_unmap_user(pdu->bio);
+	}
+
+	if (pdu->hdr) {
+		// scsi cmd is complete now, copy results to userspace
+		// printk("about to io_uring_sqe_cmd\n");
+		const struct sg_uring_cmd *cmd = io_uring_sqe_cmd(ioucmd->sqe);
+		// printk("about to put_sg_io_hdr\n");
+		if (put_sg_io_hdr(pdu->hdr, (void __user *)cmd->hdr)) {
+			printk("failed to put_sg_io_hdr\n");
+		}
+		// printk("about to kfree pdu->hdr");
+		kfree(pdu->hdr);
+		// printk("after kfree pdu->hdr");
+		pdu->hdr = NULL;
+	}
+
+	// pdu->result - result of filling in dxferp (should be 0 on success)
+	// pdu->status - state of mq_rq_state
+	io_uring_cmd_done(ioucmd, pdu->result, 0, issue_flags);
+}
+
+static inline struct request *sg_req(struct request *req)
+{
+	return blk_mq_rq_to_pdu(req);
+}
+
+static enum rq_end_io_ret sg_io_no_wait_end_io(struct request *req,
+					       blk_status_t err)
+{
+	// printk("inside sg_io_no_wait_end_io\n");
+	struct io_uring_cmd *ioucmd = req->end_io_data;
+	struct sg_uring_cmd_pdu *pdu = (struct sg_uring_cmd_pdu *)&ioucmd->pdu;
+
+	// printk("interface_id (pdu->hdr->interface_id) inside sg_io_no_wait_end_io is %c\n",
+	//    pdu->hdr->interface_id);
+	// printk("Before scsi_complete_sghdr_rq_no_unmap_user: pdu->hdr = %p, interface_id = %c\n",
+	//    pdu->hdr, pdu->hdr->interface_id);
+	pdu->result = scsi_complete_sghdr_rq_no_unmap_user(req,	pdu->hdr); // blk_rq_unmap_user is called in sg_uring_task_cb
+	// printk("After scsi_complete_sghdr_rq_no_unmap_user: pdu->hdr = %p, interface_id = %c\n",
+	//    pdu->hdr, pdu->hdr->interface_id);
+
+	pdu->status = sg_req(req)->state;
+	pdu->req = req;
+
+	// TODO: polling is not looked into for sg
+	if (blk_rq_is_poll(req)) {
+		// printk("about to sg_uring_task_cb\n");
+		sg_uring_task_cb(ioucmd, IO_URING_F_UNLOCKED);
+	} else {
+		// printk("about to io_uring_cmd_do_in_task_lazy\n");
+		// printk("ioucmd before: %p", ioucmd);
+		io_uring_cmd_do_in_task_lazy(ioucmd, sg_uring_task_cb);
+		// printk("ioucmd after: %p", ioucmd);
+	}
+
+	return RQ_END_IO_FREE;
+}
+
+int sg_io_no_wait(struct scsi_device *sdev, bool open_for_write,
+		  struct io_uring_cmd *ioucmd)
+{
+	// based on: static int sg_io(struct scsi_device *sdev, struct sg_io_hdr *hdr, bool open_for_write)
+	// printk("inside sg_io_no_wait\n");
+
+	const struct sg_uring_cmd *cmd = io_uring_sqe_cmd(ioucmd->sqe);
+
+	// printk("sizeof(struct sg_uring_cmd_pdu) is %d. must be <= 32 bytes",
+	//    sizeof(struct sg_uring_cmd_pdu));
+	BUILD_BUG_ON(sizeof(struct sg_uring_cmd_pdu) > sizeof(ioucmd->pdu));
+	struct sg_uring_cmd_pdu *pdu = (struct sg_uring_cmd_pdu *)&ioucmd->pdu;
+
+	// printk("about to kmalloc sg_io_hdr\n");
+	pdu->hdr = kmalloc(sizeof(struct sg_io_hdr), GFP_KERNEL);
+	if (!pdu->hdr)
+		return -ENOMEM;
+
+	// printk("about to get_sg_io_hdr\n");
+	int error = get_sg_io_hdr(pdu->hdr,	cmd->hdr); // putting hdr to pdu to use it in kernel space with copy_from_user
+	if (error)
+		return error;
+
+	ssize_t ret = 0;
+	int writing = 0;
+	int at_head = 0;
+	struct request *rq;
+	struct scsi_cmnd *scmd;
+
+	// printk("interface_id inside sg_io_no_wait is %c\n", pdu->hdr->interface_id);
+
+	// printk("about to hdr->interface_id\n");
+	if (pdu->hdr->interface_id != 'S')
+		return -EINVAL;
+
+	// printk("about to hdr->dxfer_len and queue_max_hw_sectors(sdev->request_queue)\n");
+	if (pdu->hdr->dxfer_len >
+	    (queue_max_hw_sectors(sdev->request_queue) << 9))
+		return -EIO;
+
+	// printk("about to hdr->dxfer_len\n");
+	if (pdu->hdr->dxfer_len) {
+		// printk("about to hdr->dxfer_direction\n");
+		switch (pdu->hdr->dxfer_direction) {
+		default:
+			return -EINVAL;
+		case SG_DXFER_TO_DEV:
+			writing = 1;
+			break;
+		case SG_DXFER_TO_FROM_DEV:
+		case SG_DXFER_FROM_DEV:
+			break;
+		}
+	}
+
+	// printk("about to hdr->flags\n");
+	if (pdu->hdr->flags & SG_FLAG_Q_AT_HEAD)
+		at_head = 1;
+
+	// printk("about to scsi_alloc_request\n");
+	rq = scsi_alloc_request(sdev->request_queue,
+				writing ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN, 0);
+	if (IS_ERR(rq))
+		return PTR_ERR(rq);
+	// printk("about to blk_mq_rq_to_pdu\n");
+	scmd = blk_mq_rq_to_pdu(rq);
+
+	// printk("about to hdr->cmd_len and sizeof(scmd->cmnd)\n");
+	if (pdu->hdr->cmd_len > sizeof(scmd->cmnd)) {
+		ret = -EINVAL;
+		goto out_put_request;
+	}
+
+	// printk("about to scsi_fill_sghdr_rq\n");
+	ret = scsi_fill_sghdr_rq(sdev, rq, pdu->hdr, open_for_write);
+	if (ret < 0)
+		goto out_put_request;
+
+	// printk("about to blk_rq_map_user_io\n");
+	ret = blk_rq_map_user_io(rq, NULL, pdu->hdr->dxferp,
+				 pdu->hdr->dxfer_len, GFP_KERNEL,
+				 pdu->hdr->iovec_count && pdu->hdr->dxfer_len,
+				 pdu->hdr->iovec_count, 0, rq_data_dir(rq));
+	if (ret)
+		goto out_put_request;
+
+	scmd->allowed = 0;
+
+	/* to free bio on completion, as req->bio will be null at that time */
+	pdu->bio = rq->bio;
+	pdu->req = rq;
+	rq->end_io_data = ioucmd; // ioucmd includes pdu that has just been configured with bio, req, hdr
+	rq->end_io = sg_io_no_wait_end_io;
+
+	// printk("Before blk_execute_rq_nowait: pdu->hdr = %p, interface_id = %c\n",
+	//    pdu->hdr, pdu->hdr->interface_id);
+	blk_execute_rq_nowait(rq, at_head);
+	return -EIOCBQUEUED;
+
+out_put_request:
+	blk_mq_free_request(rq);
+	return ret;
+}
+EXPORT_SYMBOL(sg_io_no_wait);
 
 /**
  * sg_scsi_ioctl  --  handle deprecated SCSI_IOCTL_SEND_COMMAND ioctl
@@ -518,7 +731,7 @@ out_put_request:
  *      bytes in one int) where the lowest byte is the SCSI status.
  */
 static int sg_scsi_ioctl(struct request_queue *q, bool open_for_write,
-		struct scsi_ioctl_command __user *sic)
+			 struct scsi_ioctl_command __user *sic)
 {
 	struct request *rq;
 	int err;
@@ -793,7 +1006,7 @@ static int scsi_put_cdrom_generic_arg(const struct cdrom_generic_command *cgc,
 }
 
 static int scsi_cdrom_send_packet(struct scsi_device *sdev, bool open_for_write,
-		void __user *arg)
+				  void __user *arg)
 {
 	struct cdrom_generic_command cgc;
 	struct sg_io_hdr hdr;
@@ -849,7 +1062,7 @@ static int scsi_cdrom_send_packet(struct scsi_device *sdev, bool open_for_write,
 }
 
 static int scsi_ioctl_sg_io(struct scsi_device *sdev, bool open_for_write,
-		void __user *argp)
+			    void __user *argp)
 {
 	struct sg_io_hdr hdr;
 	int error;
@@ -879,7 +1092,7 @@ static int scsi_ioctl_sg_io(struct scsi_device *sdev, bool open_for_write,
  * Return: varies depending on the @cmd
  */
 int scsi_ioctl(struct scsi_device *sdev, bool open_for_write, int cmd,
-		void __user *arg)
+	       void __user *arg)
 {
 	struct request_queue *q = sdev->request_queue;
 	struct scsi_sense_hdr sense_hdr;
@@ -940,8 +1153,8 @@ int scsi_ioctl(struct scsi_device *sdev, bool open_for_write, int cmd,
 		return scsi_send_start_stop(sdev, 1);
 	case SCSI_IOCTL_STOP_UNIT:
 		return scsi_send_start_stop(sdev, 0);
-        case SCSI_IOCTL_GET_PCI:
-                return scsi_ioctl_get_pci(sdev, arg);
+	case SCSI_IOCTL_GET_PCI:
+		return scsi_ioctl_get_pci(sdev, arg);
 	case SG_SCSI_RESET:
 		return scsi_ioctl_reset(sdev, arg);
 	}
@@ -970,7 +1183,7 @@ EXPORT_SYMBOL(scsi_ioctl);
  * Return: %0 on success, <0 error code.
  */
 int scsi_ioctl_block_when_processing_errors(struct scsi_device *sdev, int cmd,
-		bool ndelay)
+					    bool ndelay)
 {
 	if (cmd == SG_SCSI_RESET && ndelay) {
 		if (scsi_host_in_recovery(sdev->host))

@@ -11,8 +11,8 @@
  *        Copyright (C) 1998 - 2014 Douglas Gilbert
  */
 
-static int sg_version_num = 30536;	/* 2 digits for each component */
-#define SG_VERSION_STR "3.5.36"
+static int sg_version_num = 30537;	/* 2 digits for each component */
+#define SG_VERSION_STR "3.5.37"
 
 /*
  *  D. P. Gilbert (dgilbert@interlog.com), notes:
@@ -48,6 +48,7 @@ static int sg_version_num = 30536;	/* 2 digits for each component */
 #include <linux/ratelimit.h>
 #include <linux/uio.h>
 #include <linux/cred.h> /* for sg_check_file_access() */
+#include <linux/io_uring.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -200,6 +201,7 @@ static Sg_request *sg_add_request(Sg_fd * sfp);
 static int sg_remove_request(Sg_fd * sfp, Sg_request * srp);
 static Sg_device *sg_get_dev(int dev);
 static void sg_device_destroy(struct kref *kref);
+struct scsi_device *get_scsi_device_from_inode(struct inode *inode);
 
 #define SZ_SG_HEADER sizeof(struct sg_header)
 #define SZ_SG_IO_HDR sizeof(sg_io_hdr_t)
@@ -1406,6 +1408,43 @@ sg_rq_end_io(struct request *rq, blk_status_t status)
 	return RQ_END_IO_NONE;
 }
 
+int sg_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
+{
+	// printk("inside sg_uring_cmd\n");
+	const struct sg_uring_cmd *cmd = io_uring_sqe_cmd(ioucmd->sqe);
+
+	// IOPOLL not supported yet
+	if (issue_flags & IO_URING_F_IOPOLL)
+		return -EOPNOTSUPP;
+
+	// userspace needs to set IO_URING_F_SQE128, otherwise sg_io_hdr_t won't fit in SQE
+	if ((issue_flags & (IO_URING_F_SQE128|IO_URING_F_CQE32)) != (IO_URING_F_SQE128|IO_URING_F_CQE32)) {
+		return -EOPNOTSUPP;
+	}
+
+	struct inode *inode = ioucmd->file->f_inode;
+	struct scsi_device *scsi_dev = get_scsi_device_from_inode(inode);
+
+	bool open_for_write = ioucmd->file->f_mode & FMODE_WRITE;
+
+	int ret;
+	if (!cmd->hdr){
+		// printk(KERN_ERR "Invalid sg_io_hdr ptr\n");
+		return -EFAULT;
+	}
+
+	switch (ioucmd->cmd_op) {
+	case SG_IO_URING:
+		ret = sg_io_no_wait(scsi_dev, open_for_write, ioucmd);
+		break;
+	default:
+		ret = -ENOTTY;
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(sg_uring_cmd);
+
 static const struct file_operations sg_fops = {
 	.owner = THIS_MODULE,
 	.read = sg_read,
@@ -1417,6 +1456,7 @@ static const struct file_operations sg_fops = {
 	.mmap = sg_mmap,
 	.release = sg_release,
 	.fasync = sg_fasync,
+	.uring_cmd = sg_uring_cmd,
 };
 
 static const struct class sg_sysfs_class = {

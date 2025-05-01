@@ -64,6 +64,10 @@ typedef struct sg_io_hdr
     unsigned int info;          /* [o] auxiliary information */
 } sg_io_hdr_t;  /* 64 bytes long (on i386) */
 
+struct sg_uring_cmd {
+	sg_io_hdr_t *hdr;
+};
+
 #if defined(__KERNEL__)
 #include <linux/compat.h>
 
@@ -236,6 +240,9 @@ typedef struct sg_req_info { /* used by SG_GET_REQUEST_TABLE ioctl() */
 
 /* synchronous SCSI command ioctl, (only in version 3 interface) */
 #define SG_IO 0x2285   /* similar effect as write() followed by read() */
+
+/* asynchronous SCSI ioctl-like command, utilizes io_uring */
+#define SG_IO_URING 0x2290
 
 #define SG_GET_REQUEST_TABLE 0x2286   /* yields table of active requests */
 

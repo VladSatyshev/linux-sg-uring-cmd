@@ -37,6 +37,14 @@ typedef struct scsi_idlun {
 	__u32 host_unique_id;
 } Scsi_Idlun;
 
+struct sg_uring_cmd_pdu {
+	sg_io_hdr_t *hdr;
+	struct request *req;
+	struct bio *bio;
+	int result;
+	int status;
+};
+
 /* Fibre Channel WWN, port_id struct */
 typedef struct scsi_fctargaddress {
 	__u32 host_port_id;
@@ -50,6 +58,7 @@ int scsi_ioctl(struct scsi_device *sdev, bool open_for_write, int cmd,
 int get_sg_io_hdr(struct sg_io_hdr *hdr, const void __user *argp);
 int put_sg_io_hdr(const struct sg_io_hdr *hdr, void __user *argp);
 bool scsi_cmd_allowed(unsigned char *cmd, bool open_for_write);
+int sg_io_no_wait(struct scsi_device *sdev, bool open_for_write, struct io_uring_cmd *ioucmd);
 
 #endif /* __KERNEL__ */
 #endif /* _SCSI_IOCTL_H */
